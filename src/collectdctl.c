@@ -109,6 +109,7 @@ __attribute__((noreturn)) static void exit_usage(const char *name, int status) {
       " * getval <identifier>\n"
       " * flush [timeout=<seconds>] [plugin=<name>] [identifier=<id>]\n"
       " * listval\n"
+      " * reconfigure <config-file>\n"
       " * putval <identifier> [interval=<seconds>] <value-list(s)>\n"
 
       "\nIdentifiers:\n\n"
@@ -543,6 +544,33 @@ static int putval(lcc_connection_t *c, int argc, char **argv) {
   return 0;
 } /* putval */
 
+static int reconfigure(lcc_connection_t *c, int argc, char **argv) {
+  char command[1024];
+  char message[1024] = "";
+  int status;
+
+  assert(strcasecmp(argv[0], "reconfigure") == 0);
+
+  if (argc != 2) {
+    fprintf(stderr, "ERROR: reconfigure: Missing config file.\n");
+    return -1;
+  }
+
+  status = _ssnprintf(command, sizeof(command), "RECONFIGURE %s", argv[1]);
+  if ((status < 0) || ((size_t)status >= sizeof(command))) {
+    fprintf(stderr, "ERROR: reconfigure: Config file path is too long.\n");
+    return -1;
+  }
+
+  status = lcc_command(c, command, message, sizeof(message));
+  if (status != 0)
+    fprintf(stderr, "ERROR: %s\n", lcc_strerror(c));
+  else
+    printf("%s\n", message);
+
+  return status;
+} /* reconfigure */
+
 int main(int argc, char **argv) {
   char address[1024] = "unix:" DEFAULT_SOCK;
 
@@ -589,6 +617,8 @@ int main(int argc, char **argv) {
     status = flush(c, argc - optind, argv + optind);
   else if (strcasecmp(argv[optind], "listval") == 0)
     status = listval(c, argc - optind, argv + optind);
+  else if (strcasecmp(argv[optind], "reconfigure") == 0)
+    status = reconfigure(c, argc - optind, argv + optind);
   else if (strcasecmp(argv[optind], "putval") == 0)
     status = putval(c, argc - optind, argv + optind);
   else {

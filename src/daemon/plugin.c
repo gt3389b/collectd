@@ -79,6 +79,7 @@ struct read_func_s {
   char rf_group[DATA_MAX_NAME_LEN];
   char *rf_name;
   int rf_type;
+  bool rf_busy; /* callback executing; guarded by read_lock */
   cdtime_t rf_interval;
   cdtime_t rf_effective_interval;
   cdtime_t rf_next_read;
@@ -138,6 +139,7 @@ static llist_t *read_list;
 static int read_loop = 1;
 static pthread_mutex_t read_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t read_cond = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t read_idle_cond = PTHREAD_COND_INITIALIZER;
 static pthread_t *read_threads;
 static size_t read_threads_num;
 static cdtime_t max_read_interval = DEFAULT_MAX_READ_INTERVAL;
@@ -408,7 +410,7 @@ static int plugin_unregister(llist_t *list, const char *name) /* {{{ */
 
 /* plugin_load_file loads the shared object "file" and calls its
  * "module_register" function. Returns zero on success, non-zero otherwise. */
-static int plugin_load_file(char const *file, bool global) {
+static int plugin_load_file(char const *file, bool global, void **ret_dlh) {
   int flags = RTLD_NOW;
   if (global)
     flags |= RTLD_GLOBAL;
@@ -444,6 +446,7 @@ static int plugin_load_file(char const *file, bool global) {
   }
 
   (*reg_handle)();
+  *ret_dlh = dlh;
   return 0;
 }
 
@@ -496,6 +499,8 @@ static void *plugin_read_thread(void __attribute__((unused)) * args) {
 
     /* Must hold `read_lock' when accessing `rf->rf_type'. */
     rf_type = rf->rf_type;
+    if ((read_loop != 0) && (rf_type != RF_REMOVE))
+      rf->rf_busy = true;
     pthread_mutex_unlock(&read_lock);
 
     /* Check if we're supposed to stop.. This may have interrupted
@@ -595,7 +600,11 @@ static void *plugin_read_thread(void __attribute__((unused)) * args) {
           rf->rf_name, CDTIME_T_TO_DOUBLE(rf->rf_next_read));
 
     /* Re-insert this read function into the heap again. */
+    pthread_mutex_lock(&read_lock);
+    rf->rf_busy = false;
     c_heap_insert(read_heap, rf);
+    pthread_cond_broadcast(&read_idle_cond);
+    pthread_mutex_unlock(&read_lock);
   } /* while (read_loop) */
 
   pthread_exit(NULL);
@@ -924,7 +933,7 @@ bool plugin_is_loaded(char const *name) {
   return status == 0;
 }
 
-static int plugin_mark_loaded(char const *name) {
+static int plugin_mark_loaded(char const *name, void *dlh) {
   char *name_copy;
   int status;
 
@@ -933,7 +942,7 @@ static int plugin_mark_loaded(char const *name) {
     return ENOMEM;
 
   status = c_avl_insert(plugins_loaded,
-                        /* key = */ name_copy, /* value = */ NULL);
+                        /* key = */ name_copy, /* value = */ dlh);
   return status;
 }
 
@@ -944,10 +953,9 @@ static void plugin_free_loaded(void) {
   if (plugins_loaded == NULL)
     return;
 
-  while (c_avl_pick(plugins_loaded, &key, &value) == 0) {
+  /* The dlopen() handles (values) are intentionally not closed at exit. */
+  while (c_avl_pick(plugins_loaded, &key, &value) == 0)
     sfree(key);
-    assert(value == NULL);
-  }
 
   c_avl_destroy(plugins_loaded);
   plugins_loaded = NULL;
@@ -1028,10 +1036,11 @@ int plugin_load(char const *plugin_name, bool global) {
       continue;
     }
 
-    status = plugin_load_file(filename, global);
+    void *dlh = NULL;
+    status = plugin_load_file(filename, global, &dlh);
     if (status == 0) {
       /* success */
-      plugin_mark_loaded(plugin_name);
+      plugin_mark_loaded(plugin_name, dlh);
       ret = 0;
       INFO("plugin_load: plugin \"%s\" successfully loaded.", plugin_name);
       break;
@@ -1491,6 +1500,44 @@ EXPORT int plugin_unregister_read(const char *name) /* {{{ */
   return 0;
 } /* }}} int plugin_unregister_read */
 
+EXPORT int plugin_read_interval_set(const char *name, cdtime_t interval) /* {{{ */
+{
+  llentry_t *le;
+  read_func_t *rf;
+
+  if ((name == NULL) || (interval == 0))
+    return -EINVAL;
+
+  pthread_mutex_lock(&read_lock);
+
+  if (read_list == NULL) {
+    pthread_mutex_unlock(&read_lock);
+    return -ENOENT;
+  }
+
+  le = llist_search(read_list, name);
+  if (le == NULL) {
+    pthread_mutex_unlock(&read_lock);
+    return -ENOENT;
+  }
+
+  rf = le->value;
+  assert(rf != NULL);
+  rf->rf_interval = interval;
+  rf->rf_effective_interval = interval;
+
+  pthread_mutex_unlock(&read_lock);
+
+  /* Wake up the read threads so the new interval takes effect promptly. */
+  pthread_cond_broadcast(&read_cond);
+
+  NOTICE("plugin_read_interval_set: Set interval of read function `%s' to "
+         "%.3f seconds.",
+         name, CDTIME_T_TO_DOUBLE(interval));
+
+  return 0;
+} /* }}} int plugin_read_interval_set */
+
 EXPORT void plugin_log_available_writers(void) {
   log_list_callbacks(&list_write, "Available write targets:");
 }
@@ -1630,6 +1677,141 @@ EXPORT int plugin_unregister_notification(const char *name) {
   return plugin_unregister(list_notification, name);
 }
 
+EXPORT int plugin_init_one(const char *name) /* {{{ */
+{
+  llentry_t *le;
+  callback_func_t *cf;
+  plugin_init_cb callback;
+  plugin_ctx_t old_ctx;
+  int status;
+
+  if (name == NULL)
+    return -EINVAL;
+
+  if (list_init == NULL)
+    return ENOENT;
+
+  le = llist_search(list_init, name);
+  if (le == NULL)
+    return ENOENT;
+
+  cf = le->value;
+  old_ctx = plugin_set_ctx(cf->cf_ctx);
+  callback = cf->cf_callback;
+  status = (*callback)();
+  plugin_set_ctx(old_ctx);
+
+  if (status != 0) {
+    ERROR("Initialization of plugin `%s' failed with status %i. "
+          "Plugin will be unloaded.",
+          name, status);
+    plugin_unregister_read(name);
+    return -1;
+  }
+
+  return 0;
+} /* }}} int plugin_init_one */
+
+EXPORT int plugin_shutdown_one(const char *name) /* {{{ */
+{
+  llentry_t *le;
+  callback_func_t *cf;
+  plugin_shutdown_cb callback;
+  plugin_ctx_t old_ctx;
+  int status;
+
+  if (name == NULL)
+    return -EINVAL;
+
+  if (list_shutdown == NULL)
+    return ENOENT;
+
+  le = llist_search(list_shutdown, name);
+  if (le == NULL)
+    return ENOENT;
+
+  cf = le->value;
+  old_ctx = plugin_set_ctx(cf->cf_ctx);
+  callback = cf->cf_callback;
+  status = (*callback)();
+  plugin_set_ctx(old_ctx);
+
+  /* Unregister now so plugin_shutdown_all() doesn't call this a second
+   * time on already-released state when the daemon eventually exits. */
+  plugin_unregister_shutdown(name);
+
+  if (status != 0) {
+    WARNING("Shutdown of plugin `%s' failed with status %i.", name, status);
+    return -1;
+  }
+
+  return 0;
+} /* }}} int plugin_shutdown_one */
+
+EXPORT int plugin_unload(const char *name) /* {{{ */
+{
+  void *dlh = NULL;
+  int (*unregister_handle)(void);
+  llentry_t *le = NULL;
+  user_data_t ud = {0};
+  int status;
+
+  if (name == NULL)
+    return EINVAL;
+
+  if ((plugins_loaded == NULL) || (c_avl_get(plugins_loaded, name, &dlh) != 0))
+    return ENOENT;
+
+  unregister_handle =
+      (dlh != NULL) ? (int (*)(void))dlsym(dlh, "module_unregister") : NULL;
+  if (unregister_handle == NULL)
+    return ENOTSUP;
+
+  pthread_mutex_lock(&read_lock);
+  if (read_list != NULL)
+    le = llist_search(read_list, name);
+  if (le != NULL) {
+    read_func_t *rf = le->value;
+
+    llist_remove(read_list, le);
+    rf->rf_type = RF_REMOVE;
+    while (rf->rf_busy)
+      pthread_cond_wait(&read_idle_cond, &read_lock);
+
+    /* The free function may live in the plugin; call it before dlclose(),
+     * not later when the read thread destroys the RF_REMOVE entry. */
+    ud = rf->rf_udata;
+    rf->rf_udata = (user_data_t){0};
+  }
+  pthread_mutex_unlock(&read_lock);
+
+  if (le != NULL)
+    llentry_destroy(le);
+  free_userdata(&ud);
+
+  plugin_shutdown_one(name);
+  plugin_unregister_init(name);
+  plugin_unregister_config(name);
+  plugin_unregister_complex_config(name);
+
+  status = (*unregister_handle)();
+  if (status != 0) {
+    ERROR("plugin_unload: module_unregister() of plugin `%s' failed with "
+          "status %i; not unloading its shared object.",
+          name, status);
+    return -1;
+  }
+
+  dlclose(dlh);
+
+  void *key = NULL;
+  if (c_avl_remove(plugins_loaded, name, &key, NULL) == 0)
+    sfree(key);
+
+  INFO("plugin_unload: plugin \"%s\" successfully unloaded.", name);
+  return 0;
+} /* }}} int plugin_unload */
+
 EXPORT int plugin_init_all(void) {
   char const *chain_name;
   llentry_t *le;
@@ -1715,8 +1897,9 @@ EXPORT int plugin_init_all(void) {
   max_read_interval =
       global_option_get_time("MaxReadInterval", DEFAULT_MAX_READ_INTERVAL);
 
-  /* Start read-threads */
-  if (read_heap != NULL) {
+  /* Start read-threads even without read callbacks yet: plugins may be
+   * added at runtime via the unixsock RECONFIGURE command. */
+  {
     const char *rt;
     int num;
 

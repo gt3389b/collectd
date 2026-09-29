@@ -85,6 +85,15 @@ C<unixsock> plugin. Each value is printed on its own line. I.E<nbsp>e., this
 command returns a list of valid identifiers that may be used with the other
 commands.
 
+=item B<reconfigure> I<E<lt>config-fileE<gt>>
+
+Ask the daemon to apply a limited, live-reloadable subset of the given
+configuration file: load or unload individual plugins (unloading only works
+for plugins that support clean removal), and update the read interval of
+already-loaded plugins. This does not replace the daemon's
+full active configuration. See L<collectd-unixsock(5)> for the exact
+directives understood and their limitations.
+
 =item B<putval> I<E<lt>identifierE<gt>> [B<interval=>I<E<lt>secondsE<gt>>]
 I<E<lt>value-list(s)E<gt>>
 

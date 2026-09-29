@@ -68,6 +68,7 @@ EXTRA_DIST = \
 	src/collectd.pod \
 	src/collectdctl.pod \
 	src/collectdmon.pod \
+	src/unload_test.sh \
 	src/pinba.proto \
 	src/postgresql_default.conf \
 	src/types.db \
@@ -148,7 +149,9 @@ noinst_LTLIBRARIES = \
 
 
 check_LTLIBRARIES = \
-	libplugin_mock.la
+	libplugin_mock.la \
+	unload_test_a.la \
+	unload_test_b.la
 
 
 check_PROGRAMS = \
@@ -169,7 +172,7 @@ check_PROGRAMS = \
 	test_utils_config_cores
 
 
-TESTS = $(check_PROGRAMS)
+TESTS = $(check_PROGRAMS) src/unload_test.sh
 
 LOG_COMPILER = env VALGRIND="@VALGRIND@" $(abs_srcdir)/testwrapper.sh
 
@@ -182,7 +185,7 @@ pkglib_LTLIBRARIES =
 PLUGIN_LDFLAGS = \
 	-module \
 	-avoid-version \
-	-export-symbols-regex '\<module_register\>'
+	-export-symbols-regex '\<module_(un)?register\>'
 if BUILD_WIN32
 PLUGIN_LDFLAGS += -shared -no-undefined -lcollectd -L.
 endif
@@ -430,6 +433,13 @@ libplugin_mock_la_SOURCES = \
 
 libplugin_mock_la_CPPFLAGS = $(AM_CPPFLAGS) -DMOCK_TIME
 libplugin_mock_la_LIBADD = libcommon.la libignorelist.la $(COMMON_LIBS)
+
+# Removable plugins for src/unload_test.sh; -rpath makes libtool build them
+# as loadable modules even though they are never installed.
+unload_test_a_la_SOURCES = src/unload_test_a.c
+unload_test_a_la_LDFLAGS = $(PLUGIN_LDFLAGS) -rpath $(abs_builddir)
+unload_test_b_la_SOURCES = src/unload_test_b.c
+unload_test_b_la_LDFLAGS = $(PLUGIN_LDFLAGS) -rpath $(abs_builddir)
 
 libformat_influxdb_la_SOURCES = \
 	src/utils/format_influxdb/format_influxdb.c \

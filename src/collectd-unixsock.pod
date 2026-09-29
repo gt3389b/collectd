@@ -223,6 +223,43 @@ Example:
   -> | FLUSH plugin=rrdtool identifier=localhost/df/df-root identifier=localhost/df/df-var
   <- | 0 Done: 2 successful, 0 errors
 
+=item B<RECONFIGURE> I<config-file>
+
+Applies a limited, live-reloadable subset of configuration from I<config-file>
+without restarting the daemon. Only the following blocks are recognized;
+everything else in the file is ignored:
+
+=over 4
+
+=item B<< <LoadPlugin> >> I<name> [B<Interval> I<seconds>]
+
+Loads plugin I<name> if it isn't already loaded, and runs its init callback.
+A plugin that was removed with B<UnloadPlugin> can be loaded again.
+
+=item B<< <UnloadPlugin> >> I<name>
+
+Removes plugin I<name> from the running daemon: waits for an in-flight call
+of its read callback to finish, runs its shutdown callback, unregisters its
+callbacks and unloads its shared object.
+
+B<Only plugins that support clean removal can be unloaded.> A plugin opts in
+by exporting a C<module_unregister()> function that unregisters everything
+it registered and resets its global state, and by registering nothing but
+read, init, config and shutdown callbacks. Most plugins shipped with
+collectd do not opt in; for them B<UnloadPlugin> logs a warning and leaves
+the plugin running.
+
+=item B<< <Plugin> >> I<name> [B<Interval> I<seconds>]
+
+Updates the interval of plugin I<name>'s already-registered read function in
+place, taking effect the next time it is scheduled.
+
+=back
+
+Example:
+  -> | RECONFIGURE /etc/collectd/reconfig.conf
+  <- | 0 Reconfiguration complete: 1 plugin(s) added, 0 plugin(s) removed, 1 interval(s) updated
+
 =back
 
 =head2 Identifiers

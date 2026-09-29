@@ -158,6 +158,140 @@ static int us_open_socket(void) {
   return 0;
 } /* int us_open_socket */
 
+/* cmd_handle_reconfigure applies a subset of live-reloadable configuration
+ * from the given file:
+ *   - `<LoadPlugin NAME>' (optionally with an `Interval' option) loads NAME
+ *     if it isn't already loaded, and runs its init callback (add).
+ *   - `<UnloadPlugin NAME>' fully removes NAME via plugin_unload(), after
+ *     which it can be added again. Only plugins that export
+ *     module_unregister() support this; others are left running.
+ *   - `<Plugin NAME>' with an `Interval' option updates the interval of
+ *     NAME's already-registered read function in place (reconfigure).
+ * This does not apply any other configuration; it is intentionally narrow
+ * in scope because collectd does not support a general, safe config reload.
+ */
+static int cmd_handle_reconfigure(FILE *fh, char *buffer) {
+  char buffer_copy[1024];
+  char *fields[3];
+  int fields_num;
+  oconfig_item_t *conf;
+  int added = 0;
+  int removed = 0;
+  int changed = 0;
+
+  sstrncpy(buffer_copy, buffer, sizeof(buffer_copy));
+
+  fields_num = strsplit(buffer_copy, fields, STATIC_ARRAY_SIZE(fields));
+  if (fields_num != 2) {
+    fprintf(fh, "-1 Usage: RECONFIGURE <config-file>\n");
+    return -1;
+  }
+
+  conf = oconfig_parse_file(fields[1]);
+  if (conf == NULL) {
+    fprintf(fh, "-1 Unable to parse config file: %s\n", fields[1]);
+    return -1;
+  }
+
+  for (int i = 0; i < conf->children_num; i++) {
+    oconfig_item_t *block = conf->children + i;
+
+    if ((block->values_num != 1) ||
+        (block->values[0].type != OCONFIG_TYPE_STRING))
+      continue;
+
+    const char *plugin_name = block->values[0].value.string;
+
+    if (strcasecmp("LoadPlugin", block->key) == 0) {
+      if (plugin_is_loaded(plugin_name)) {
+        WARNING("unixsock plugin: RECONFIGURE: Plugin `%s' is already "
+                "loaded.",
+                plugin_name);
+        continue;
+      }
+
+      plugin_ctx_t ctx = {
+          .interval = cf_get_default_interval(),
+          .name = strdup(plugin_name),
+      };
+      for (int j = 0; j < block->children_num; j++) {
+        oconfig_item_t *opt = block->children + j;
+        if ((strcasecmp("Interval", opt->key) == 0) &&
+            (opt->values_num == 1) &&
+            (opt->values[0].type == OCONFIG_TYPE_NUMBER))
+          ctx.interval = DOUBLE_TO_CDTIME_T(opt->values[0].value.number);
+      }
+
+      plugin_ctx_t old_ctx = plugin_set_ctx(ctx);
+      int status = plugin_load(plugin_name, /* global = */ false);
+      plugin_set_ctx(old_ctx);
+      /* ctx.name is not freed: every callback the plugin registered
+       * holds a copy of ctx, as in dispatch_loadplugin(). */
+
+      if (status != 0) {
+        WARNING("unixsock plugin: RECONFIGURE: Failed to load plugin `%s': "
+                "%s",
+                plugin_name, STRERROR(status));
+        continue;
+      }
+
+      /* Not every plugin registers an init callback; ENOENT is fine. */
+      status = plugin_init_one(plugin_name);
+      if ((status != 0) && (status != ENOENT)) {
+        WARNING("unixsock plugin: RECONFIGURE: Initialization of plugin "
+                "`%s' failed.",
+                plugin_name);
+        continue;
+      }
+
+      added++;
+    } else if (strcasecmp("UnloadPlugin", block->key) == 0) {
+      int status = plugin_unload(plugin_name);
+      if (status == 0) {
+        removed++;
+      } else if (status == ENOTSUP) {
+        WARNING("unixsock plugin: RECONFIGURE: Plugin `%s' does not support "
+                "removal (no module_unregister()); leaving it running.",
+                plugin_name);
+      } else if (status == ENOENT) {
+        WARNING("unixsock plugin: RECONFIGURE: Plugin `%s' is not loaded.",
+                plugin_name);
+      } else {
+        WARNING("unixsock plugin: RECONFIGURE: Failed to unload plugin "
+                "`%s'.",
+                plugin_name);
+      }
+    } else if (strcasecmp("Plugin", block->key) == 0) {
+      for (int j = 0; j < block->children_num; j++) {
+        oconfig_item_t *opt = block->children + j;
+
+        if ((strcasecmp("Interval", opt->key) != 0) ||
+            (opt->values_num != 1) ||
+            (opt->values[0].type != OCONFIG_TYPE_NUMBER))
+          continue;
+
+        cdtime_t interval = DOUBLE_TO_CDTIME_T(opt->values[0].value.number);
+        int status = plugin_read_interval_set(plugin_name, interval);
+        if (status == 0) {
+          changed++;
+        } else {
+          WARNING("unixsock plugin: RECONFIGURE: Failed to update interval "
+                  "of plugin `%s': %s",
+                  plugin_name, STRERROR(-status));
+        }
+      }
+    }
+  }
+
+  oconfig_free(conf);
+
+  fprintf(fh,
+          "0 Reconfiguration complete: %i plugin(s) added, %i plugin(s) "
+          "removed, %i interval(s) updated\n",
+          added, removed, changed);
+  return 0;
+} /* int cmd_handle_reconfigure */
+
 static void *us_handle_client(void *arg) {
   int fdin;
   int fdout;
@@ -253,6 +387,8 @@ static void *us_handle_client(void *arg) {
       handle_putnotif(fhout, buffer);
     } else if (strcasecmp(fields[0], "flush") == 0) {
       cmd_handle_flush(fhout, buffer);
+    } else if (strcasecmp(fields[0], "reconfigure") == 0) {
+      cmd_handle_reconfigure(fhout, buffer);
     } else {
       if (fprintf(fhout, "-1 Unknown command: %s\n", fields[0]) < 0) {
         WARNING("unixsock plugin: failed to write to socket #%i: %s",

@@ -102,6 +102,8 @@ cscope.*
 test-suite.log
 src/tests/
 test_*
+src/unload_test.sh.log
+src/unload_test.sh.trs
 
 # src/daemon/...
 /collectd

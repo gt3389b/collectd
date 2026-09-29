@@ -250,6 +250,29 @@ int plugin_load(const char *name, bool global);
 bool plugin_is_loaded(char const *name);
 
 int plugin_init_all(void);
+/* Runs the init callback registered for a single, already-loaded plugin
+ * (e.g. one just loaded via plugin_load() after startup). Returns ENOENT
+ * if the plugin registered no init callback. On failure, any read
+ * function(s) it may have registered are unregistered, mirroring the
+ * per-plugin error handling in plugin_init_all(). */
+int plugin_init_one(const char *name);
+/* Runs and then unregisters the shutdown callback registered for a single
+ * plugin, if any, without dlclose()'ing its shared object. Returns ENOENT
+ * if the plugin registered no shutdown callback (not an error: most
+ * simple, read-only plugins don't need one). */
+int plugin_shutdown_one(const char *name);
+/* Removes a running plugin so it can later be loaded again with
+ * plugin_load(). Only plugins that export `int module_unregister(void)' are
+ * removable; others yield ENOTSUP. The read callback registered under
+ * `name' is drained (waiting for an in-flight call to finish), then the
+ * shutdown callback runs, init/config callbacks are unregistered,
+ * module_unregister() runs, and the shared object is dlclose()'d.
+ *
+ * module_unregister() must unregister every other callback the plugin
+ * registered and reset its global state. Because only the read callback is
+ * drained, removable plugins must not register callbacks that other threads
+ * may be executing concurrently (write, flush, log, notification, ...). */
+int plugin_unload(const char *name);
 void plugin_read_all(void);
 int plugin_read_all_once(void);
 int plugin_shutdown_all(void);
@@ -319,6 +342,11 @@ int plugin_register_log(const char *name, plugin_log_cb callback,
 int plugin_register_notification(const char *name,
                                  plugin_notification_cb callback,
                                  user_data_t const *user_data);
+
+/* Updates the interval of an already-registered read function, taking
+ * effect the next time it is scheduled. Returns ENOENT if no read function
+ * is registered under "name". */
+int plugin_read_interval_set(const char *name, cdtime_t interval);
 
 int plugin_unregister_config(const char *name);
 int plugin_unregister_complex_config(const char *name);

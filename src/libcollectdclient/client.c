@@ -900,6 +900,34 @@ int lcc_listval(lcc_connection_t *c, /* {{{ */
   return 0;
 } /* }}} int lcc_listval */
 
+int lcc_command(lcc_connection_t *c, const char *command, char *message,
+                size_t message_size) /* {{{ */
+{
+  lcc_response_t res = {0};
+  int status;
+
+  if ((c == NULL) || (command == NULL))
+    return EINVAL;
+
+  status = lcc_sendreceive(c, command, &res);
+  if (status != 0)
+    return status;
+
+  if ((message != NULL) && (message_size > 0)) {
+    strncpy(message, res.message, message_size - 1);
+    message[message_size - 1] = '\0';
+  }
+
+  if (res.status != 0) {
+    LCC_SET_ERRSTR(c, "%s", res.message);
+    lcc_response_free(&res);
+    return -1;
+  }
+
+  lcc_response_free(&res);
+  return 0;
+} /* }}} int lcc_command */
+
 const char *lcc_strerror(lcc_connection_t *c) /* {{{ */
 {
   if (c == NULL)
